@@ -449,11 +449,11 @@ CREATE TRIGGER trg_update_vip_cestujuci
 
 
 -- =============================================================================
--- ČASŤ 7: ULOŽENÁ PROCEDÚRA A FUNKCIA (odovzdávka 3)
+-- ČASŤ 7: PROCEDÚRY A FUNKCIE (3. ODOVZDÁVKA)
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------
--- ULOŽENÁ PROCEDÚRA: zrušenie letu
+-- PROCEDÚRA: zrušenie letu
 -- Účel: Nastaví stav zadaného letu (podľa čísla letu a dátumu odletu)
 --       na 'zrušený' a vypíše počet ovplyvnených leteniek. Zabezpečuje
 --       konzistentné zrušenie letu jedným volaním bez manuálnych UPDATE.
@@ -463,7 +463,7 @@ CREATE OR REPLACE PROCEDURE zrus_let(
     p_cislo_letu    TEXT,
     p_datum_odletu  DATE
 )
-    LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql AS $$
 DECLARE
     v_id_let        INT;
     v_id_stav_zrus  INT;
@@ -501,6 +501,57 @@ END;
 $$;
 
 -- -----------------------------------------------------------------------------
+-- PROCEDÚRA: zmena stavu batožiny
+-- Účel: Procedúra zmení stav batožiny podľa jej id na nový zadaný stav.
+--       Pred zmenou overí, či batožina existuje a či zadaný stav existuje
+--       v číselníku stav_batoziny. Ak nie, vyhodí zrozumiteľnú výnimku.
+--       Tým sa zabraňuje nekonzistentným ručným UPDATE-om mimo systému
+--       a celý handling batožín prechádza cez jednu procedúru.
+-- Použitie:
+--   CALL zmen_stav_batoziny(3, 'uložená');
+--   CALL zmen_stav_batoziny(3, 'vyzdvihnutá');
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE zmen_stav_batoziny(
+    p_id_batozina   INT,
+    p_novy_stav     TEXT
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_id_novy_stav      INT;
+    v_aktualny_stav     TEXT;
+BEGIN
+    -- Overenie existencie batožiny a načítanie aktuálneho stavu
+    SELECT sb.stav
+    INTO v_aktualny_stav
+    FROM batozina b
+    INNER JOIN stav_batoziny sb ON b.id_stav_batoziny = sb.id_stav_batoziny
+    WHERE b.id_batozina = p_id_batozina;
+
+    IF v_aktualny_stav IS NULL THEN
+        RAISE EXCEPTION 'Batožina s id % neexistuje.', p_id_batozina;
+    END IF;
+
+    -- Overenie existencie nového stavu v číselníku
+    SELECT id_stav_batoziny
+    INTO v_id_novy_stav
+    FROM stav_batoziny
+    WHERE stav = p_novy_stav;
+
+    IF v_id_novy_stav IS NULL THEN
+        RAISE EXCEPTION 'Stav "%" neexistuje v číselníku stav_batoziny.', p_novy_stav;
+    END IF;
+
+    -- Samotná zmena stavu
+    UPDATE batozina
+    SET id_stav_batoziny = v_id_novy_stav
+    WHERE id_batozina = p_id_batozina;
+
+    RAISE NOTICE 'Batožina % zmenila stav: "%" -> "%".',
+        p_id_batozina, v_aktualny_stav, p_novy_stav;
+END;
+$$;
+
+-- -----------------------------------------------------------------------------
 -- FUNKCIA: celkové tržby leteckej spoločnosti za zadané obdobie
 -- Účel: Vráti sumu cien leteniek pre danú leteckú spoločnosť (IATA kód)
 --       v zadanom rozsahu dátumov rezervácie. Použiteľná v reportoch
@@ -512,17 +563,17 @@ CREATE OR REPLACE FUNCTION trzby_spolocnosti(
     p_od        DATE,
     p_do        DATE
 )
-    RETURNS NUMERIC
-    LANGUAGE plpgsql AS $$
+RETURNS NUMERIC
+LANGUAGE plpgsql AS $$
 DECLARE
     v_trzby NUMERIC;
 BEGIN
     SELECT COALESCE(SUM(lt.cena), 0)
     INTO v_trzby
     FROM letenka lt
-             INNER JOIN let l               ON lt.id_let        = l.id_let
-             INNER JOIN lietadlo lp         ON l.id_lietadlo     = lp.id_lietadlo
-             INNER JOIN letecka_spolocnost ls ON lp.id_spolocnost = ls.id_spolocnost
+    INNER JOIN let l               ON lt.id_let        = l.id_let
+    INNER JOIN lietadlo lp         ON l.id_lietadlo     = lp.id_lietadlo
+    INNER JOIN letecka_spolocnost ls ON lp.id_spolocnost = ls.id_spolocnost
     WHERE ls.iata_kod = p_iata_kod
       AND DATE(lt.datum_rezervacie AT TIME ZONE 'UTC') BETWEEN p_od AND p_do;
 
@@ -530,6 +581,48 @@ BEGIN
 END;
 $$;
 
+
+-- -----------------------------------------------------------------------------
+-- FUNKCIA: priemerné vyťaženie lietadiel leteckej spoločnosti
+-- Účel: Pre danú leteckú spoločnosť (podľa IATA kódu) vráti priemerné
+--       percentuálne vyťaženie jej lietadiel – teda koľko percent kapacity
+--       bolo priemerne obsadených letenkami naprieč všetkými jej letmi.
+--       Výsledok je zaokrúhlený na 2 desatinné miesta.
+--       Využíva sa pri hodnotení efektivity prevádzky leteckej spoločnosti.
+-- Použitie:
+--   SELECT vytazenie_spolocnosti('EK');
+--   SELECT vytazenie_spolocnosti('FR');
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION vytazenie_spolocnosti(
+    p_iata_kod  VARCHAR(2)
+)
+RETURNS NUMERIC
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_vytazenie NUMERIC;
+BEGIN
+    SELECT COALESCE(
+        AVG(
+            -- obsadenosť jedného letu v percentách
+            pocet_leteniek::NUMERIC / lp.kapacita * 100
+        ),
+        0
+    )::NUMERIC(5,2)
+    INTO v_vytazenie
+    FROM (
+        -- vnorený dopyt: počet leteniek pre každý let
+        SELECT l.id_let, l.id_lietadlo, COUNT(lt.id_letenka) AS pocet_leteniek
+        FROM let l
+        LEFT JOIN letenka lt ON lt.id_let = l.id_let
+        GROUP BY l.id_let, l.id_lietadlo
+    ) lety
+    INNER JOIN lietadlo lp         ON lety.id_lietadlo   = lp.id_lietadlo
+    INNER JOIN letecka_spolocnost ls ON lp.id_spolocnost = ls.id_spolocnost
+    WHERE ls.iata_kod = p_iata_kod;
+
+    RETURN v_vytazenie;
+END;
+$$;
 
 -- =============================================================================
 -- UKÁŽKY POUŽITIA (odkomentovať pre testovanie)
@@ -549,8 +642,7 @@ $$;
 -- SELECT * FROM nadpriemerné_lety;
 
 -- Autoinkrementácia – id sa generuje automaticky:
--- INSERT INTO krajina (nazov) VALUES ('Taliansko'); SELECT id_krajina,nazov FROM krajina;
--- DELETE FROM krajina where nazov = 'Taliansko'
+-- INSERT INTO krajina (nazov) VALUES ('Taliansko');
 -- INSERT INTO cestujuci (meno, priezvisko, cislo_pasu, statna_prislusnost, datum_narodenia)
 --     VALUES ('Anna', 'Kováčová', 'SK9999999', 'Slovenská', '1990-05-10');
 
@@ -561,6 +653,16 @@ $$;
 -- Procedúra:
 -- CALL zrus_let('FR123', '2026-03-05');
 
+-- Procedúra – zmena stavu batožiny:
+-- CALL zmen_stav_batoziny(1, 'uložená');
+-- CALL zmen_stav_batoziny(1, 'vyzdvihnutá');
+-- CALL zmen_stav_batoziny(1, 'neexistujúci stav');  -- vyhodí výnimku
+
 -- Funkcia:
 -- SELECT trzby_spolocnosti('EK', '2026-01-01', '2026-12-31');
 -- SELECT trzby_spolocnosti('LH', '2026-01-01', '2026-12-31');
+
+-- Funkcia – priemerné vyťaženie lietadiel spoločnosti:
+-- SELECT vytazenie_spolocnosti('EK');   -- Emirates
+-- SELECT vytazenie_spolocnosti('FR');   -- Ryanair
+-- SELECT vytazenie_spolocnosti('LH');   -- Lufthansa
